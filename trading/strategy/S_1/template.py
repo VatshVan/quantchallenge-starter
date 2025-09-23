@@ -71,92 +71,83 @@ def cancel_order(ticker: Ticker, order_id: int) -> bool:
     return 0
 
 class Strategy:
+    """Template for a strategy."""
 
     def reset_state(self) -> None:
-        """Reset state at game start or END_GAME."""
-        self.position = 0.0        # Net position (positive = long, negative = short)
-        self.cash = 0.0            # Track cash PnL if needed
-        self.last_market_price = 50.0  # Default fair starting prob = 50%
-        self.total_time = 2400.0   # Default; will adjust if first START_PERIOD shows 2880
-        print("State reset.")
+        """Reset the state of the strategy to the start of game position.
+        
+        Since the sandbox execution can start mid-game, we recommend creating a
+        function which can be called from __init__ and on_game_event_update (END_GAME).
+
+        Note: In production execution, the game will start from the beginning
+        and will not be replayed.
+        """
+        self.position: int = 0
+        self.entry_price: Optional[float] = None
+        self.capital: float = 100000.0
+        self.quantity: float = 100.0
+        self.home_score: int = 0
+        self.away_score: int = 0
+        self.time_seconds: float = 48 * 60  # assume basketball 48 minutes
 
     def __init__(self) -> None:
+        """Your initialization code goes here."""
         self.reset_state()
 
-    def estimate_home_win_prob(self, home_score: int, away_score: int, time_seconds: float) -> float:
-        """Heuristic probability model for home win."""
-        lead = home_score - away_score
-        time_factor = max(0.0, time_seconds / self.total_time)
+    def model_probability(self) -> float:
+        """Logistic win probability model using score differential and time."""
+        score_diff = self.home_score - self.away_score
+        time_frac = max(self.time_seconds, 1) / (48 * 60)  # normalize to [0,1]
+        k = 0.1  # aggressiveness parameter
+        return 1 / (1 + math.exp(-k * score_diff / time_frac))
+    def on_orderbook_update(self, ticker: Ticker, side: Side, quantity: float, price: float) -> None:
+        market_prob = price / 100.0
+        model_prob = self.model_probability()
 
-        # Base probability = 50%
-        p = 0.5 + (lead / 20.0) * (1 - time_factor)
+        # Buy if undervalued
+        if self.position == 0 and market_prob < model_prob * 0.90:
+            print(f"BUY: Market {market_prob:.2f}, Model {model_prob:.2f}")
+            place_market_order(Side.BUY, ticker, self.quantity)
+            self.position = 1
+            self.entry_price = market_prob
 
-        # Clamp between 1% and 99%
-        return min(max(p, 0.01), 0.99)
+        # Sell if overvalued
+        elif self.position == 1 and market_prob > model_prob * 1.05:
+            print(f"SELL: Market {market_prob:.2f}, Model {model_prob:.2f}")
+            place_market_order(Side.SELL, ticker, self.quantity)
+            self.position = 0
+            self.entry_price = None
 
     def on_trade_update(self, ticker: Ticker, side: Side, quantity: float, price: float) -> None:
-        print(f"Trade update: {ticker} {side.name} {quantity} @ {price}")
-
-    def on_orderbook_update(self, ticker: Ticker, side: Side, quantity: float, price: float) -> None:
-        """Update latest market price (midpoint proxy)."""
-        # Simplify: store last quoted price for signal comparison
-        self.last_market_price = price
-        # print(f"Orderbook update: {ticker} {side.name} qty={quantity} price={price}")
+        print(f"Trade update: {ticker} {side} {quantity} @ {price}")
 
     def on_account_update(self, ticker: Ticker, side: Side, price: float, quantity: float, capital_remaining: float) -> None:
-        if side == Side.BUY:
-            self.position += quantity
-        else:
-            self.position -= quantity
-        print(f"Account update: pos={self.position}, cap={capital_remaining}")
+        self.capital = capital_remaining
+        print(f"Account update: {side} {quantity} @ {price}, capital {capital_remaining}")
 
-    def on_game_event_update(
-        self,
-        event_type: str,
-        home_away: str,
-        home_score: int,
-        away_score: int,
-        player_name: Optional[str],
-        substituted_player_name: Optional[str],
-        shot_type: Optional[str],
-        assist_player: Optional[str],
-        rebound_type: Optional[str],
-        coordinate_x: Optional[float],
-        coordinate_y: Optional[float],
-        time_seconds: Optional[float],
-    ) -> None:
-        print(f"Event: {event_type} | Score {home_score}-{away_score} | t={time_seconds:.1f}")
+    def on_game_event_update(self,
+                           event_type: str,
+                           home_away: str,
+                           home_score: int,
+                           away_score: int,
+                           player_name: Optional[str],
+                           substituted_player_name: Optional[str],
+                           shot_type: Optional[str],
+                           assist_player: Optional[str],
+                           rebound_type: Optional[str],
+                           coordinate_x: Optional[float],
+                           coordinate_y: Optional[float],
+                           time_seconds: Optional[float]
+        ) -> None:
 
-        # Adjust game length if detected
-        if event_type == "START_PERIOD" and time_seconds and time_seconds > self.total_time:
-            self.total_time = time_seconds
+        self.home_score = home_score
+        self.away_score = away_score
+        if time_seconds is not None:
+            self.time_seconds = time_seconds
 
-        # Skip if no score/time context
-        if time_seconds is None:
-            return
-
-        # Estimate fair probability
-        model_prob = self.estimate_home_win_prob(home_score, away_score, time_seconds)
-
-        # Market implied prob from last price
-        market_prob = self.last_market_price / 100.0
-
-        # Threshold to avoid noise
-        threshold = 0.05
-
-        # Compare and trade
-        if model_prob > market_prob + threshold:
-            # Market underestimates Team A → BUY
-            place_market_order(Side.BUY, Ticker.TEAM_A, quantity=1.0)
-            print(f"BUY signal: model={model_prob:.2f}, market={market_prob:.2f}")
-
-        elif model_prob < market_prob - threshold:
-            # Market overestimates Team A → SELL/SHORT
-            place_market_order(Side.SELL, Ticker.TEAM_A, quantity=1.0)
-            print(f"SELL signal: model={model_prob:.2f}, market={market_prob:.2f}")
+        print(f"Event {event_type}: Score {home_score}-{away_score}, Time {self.time_seconds}s")
 
         if event_type == "END_GAME":
-            # Reset everything for next game
             self.reset_state()
     
     # def on_trade_update(
